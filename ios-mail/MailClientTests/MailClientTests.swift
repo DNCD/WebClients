@@ -145,7 +145,7 @@ final class CryptoTests: XCTestCase {
 
         let addresses = try XCTUnwrap(package["Addresses"] as? [String: [String: Any]])
         let keyPacket = try XCTUnwrap(Data(base64Encoded: try XCTUnwrap(addresses["you@example.com"]?["BodyKeyPacket"] as? String)))
-        let dataPacket = try XCTUnwrap(Data(base64Encoded: try XCTUnwrap(package["Body"] as? String)))
+        let dataPacket = try XCTUnwrap(package["Body"] as? Data)
 
         let sessionKey = try recipient.decryptionRing.decryptSessionKey(keyPacket)
         XCTAssertEqual(try sessionKey.decrypt(dataPacket).getString(), "Hello there")

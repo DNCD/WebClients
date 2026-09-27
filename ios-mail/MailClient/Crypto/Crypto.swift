@@ -35,8 +35,11 @@ enum Crypto {
         try call { CryptoGo.HelperGenerateKey(email, email, Data(passphrase.utf8), "x25519", 0, $0) }
     }
 
+    /// Key ring for encrypting to an armored key. Recipient keys from the API are already public;
+    /// GopenPGP refuses `toPublic()` on those, so only private keys are converted.
     static func publicKeyRing(armored: String) throws -> CryptoKeyRing {
-        try keyRing([try key(armored: armored).toPublic()])
+        let parsed = try key(armored: armored)
+        return try keyRing([parsed.isPrivate() ? try parsed.toPublic() : parsed])
     }
 
     /// Key passphrase derivation, as in ProtonCore `LoginService.makePassphrases`: bcrypt the password
