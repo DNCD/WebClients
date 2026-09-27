@@ -31,8 +31,8 @@ actor MailStore {
     }
 
     static func destroy(accountID: String) {
-        let url = url(forAccount: accountID)
-        try? FileManager.default.removeItem(at: url.deletingLastPathComponent())
+        let fileURL = url(forAccount: accountID)
+        try? FileManager.default.removeItem(at: fileURL.deletingLastPathComponent())
         Keychain.delete("store.\(accountID).key")
     }
 
@@ -128,9 +128,9 @@ actor MailStore {
     }
 
     func update(_ id: String, _ change: (inout MessageMetadata) -> Void) throws {
-        guard var message = try message(id: id) else { return }
-        change(&message)
-        try upsert([message])
+        guard var current = try message(id: id) else { return }
+        change(&current)
+        try upsert([current])
     }
 
     func unreadCount(labelID: String) throws -> Int {

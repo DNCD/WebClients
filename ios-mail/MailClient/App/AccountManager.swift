@@ -131,7 +131,7 @@ final class AccountManager {
     }
 
     private func performNotificationAction(accountID: String, messageID: String, action: String) async {
-        guard let account = account(accountID), let sync = account.sync else { return }
+        guard let target = account(accountID), let sync = target.sync else { return }
         if action == NotificationManager.markReadAction {
             await sync.applyLocally(messageID) { $0.unread = 0 }
             try? await sync.service.markRead([messageID])

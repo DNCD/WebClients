@@ -108,8 +108,8 @@ enum AttachmentEncryption {
 
     /// Decrypts a downloaded attachment (the data packet) using its key packets from the metadata.
     static func decrypt(_ dataPacket: Data, keyPackets: String, keys: MailKeys.AddressKeys) throws -> Data {
-        let sessionKey = try sessionKey(keyPackets: keyPackets, keys: keys)
-        guard let data = try sessionKey.decrypt(dataPacket).getBinary() else { throw CryptoError.unexpectedNil }
+        let key = try sessionKey(keyPackets: keyPackets, keys: keys)
+        guard let data = try key.decrypt(dataPacket).getBinary() else { throw CryptoError.unexpectedNil }
         return data
     }
 
