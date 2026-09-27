@@ -57,7 +57,7 @@ extension Error {
                 return false
             }
         }
-        if case APIError.server(let status, _, _) = self {
+        if let apiError = self as? APIError, case .server(let status, _, _) = apiError {
             return status >= 500 || status == 429
         }
         return false
