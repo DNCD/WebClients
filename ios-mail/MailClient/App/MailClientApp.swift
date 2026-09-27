@@ -16,6 +16,7 @@ struct MailClientApp: App {
     }
 
     var body: some Scene {
+        let accounts = manager
         WindowGroup {
             RootView()
                 .environment(settings)
@@ -36,7 +37,7 @@ struct MailClientApp: App {
             }
         }
         .backgroundTask(.appRefresh(NotificationManager.refreshTaskID)) {
-            await manager.backgroundRefresh()
+            await accounts.backgroundRefresh()
         }
     }
 }

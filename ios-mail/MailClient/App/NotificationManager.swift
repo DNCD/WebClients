@@ -164,15 +164,14 @@ extension NotificationManager: UNUserNotificationCenterDelegate {
                                             didReceive response: UNNotificationResponse) async {
         let info = response.notification.request.content.userInfo
         guard let accountID = info["accountID"] as? String, let messageID = info["messageID"] as? String else { return }
-        let action = response.actionIdentifier
-        await MainActor.run {
-            if action == UNNotificationDefaultActionIdentifier {
-                self.pendingOpen = (accountID, messageID)
-            }
-        }
-        if action == Self.markReadAction || action == Self.archiveAction {
-            let handler = await MainActor.run { self.actionHandler }
-            await handler?(accountID, messageID, action)
+        await handleResponse(action: response.actionIdentifier, accountID: accountID, messageID: messageID)
+    }
+
+    private func handleResponse(action: String, accountID: String, messageID: String) async {
+        if action == UNNotificationDefaultActionIdentifier {
+            pendingOpen = (accountID, messageID)
+        } else if action == Self.markReadAction || action == Self.archiveAction {
+            await actionHandler?(accountID, messageID, action)
         }
     }
 }

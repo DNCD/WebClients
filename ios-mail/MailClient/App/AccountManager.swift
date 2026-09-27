@@ -181,9 +181,10 @@ final class AccountManager {
         activeAccountID = UserDefaults.standard.string(forKey: Self.activeKey) ?? accounts.first?.id
         loginStep = accounts.isEmpty ? .credentials : nil
         isRestoring = false
+        let settings = settings
         await withTaskGroup(of: Void.self) { group in
             for account in accounts {
-                group.addTask { await account.load(settings: self.settings) }
+                group.addTask { @MainActor in await account.load(settings: settings) }
             }
         }
     }

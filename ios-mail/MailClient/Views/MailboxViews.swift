@@ -298,7 +298,7 @@ struct MessageListView: View {
             if newValue.isEmpty { model.clearSearch() }
         }
         .refreshable { await model.refresh() }
-        .task { await model.refresh() }
+        .task(id: ObjectIdentifier(model)) { await model.refresh() }
         .onChange(of: model.revision) {
             Task { await model.reloadFromStore() }
         }
