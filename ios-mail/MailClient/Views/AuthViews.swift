@@ -1,35 +1,37 @@
 import SwiftUI
 
 struct RootView: View {
-    @Environment(SessionModel.self) private var session
+    @Environment(AccountManager.self) private var manager
+    @Environment(AppSettings.self) private var settings
 
     var body: some View {
         Group {
-            switch session.state {
-            case .launching:
+            if manager.isRestoring && manager.accounts.isEmpty {
                 LaunchView()
-            case .signedOut:
-                LoginView()
-            case .twoFactor:
-                TwoFactorView()
-            case .mailboxPassword:
-                MailboxPasswordView()
-            case .loadFailed(let message):
+            } else if let step = manager.loginStep {
+                switch step {
+                case .credentials: LoginView()
+                case .twoFactor: TwoFactorView()
+                case .mailboxPassword: MailboxPasswordView()
+                }
+            } else if let account = manager.activeAccount, case .failed(let message) = account.state, manager.readyAccounts.isEmpty {
                 ContentUnavailableView {
                     Label("Couldn't load your mailbox", systemImage: "wifi.exclamationmark")
                 } description: {
                     Text(message)
                 } actions: {
-                    Button("Try Again") { Task { await session.loadMailbox() } }
+                    Button("Try Again") { Task { await account.load(settings: settings) } }
                         .buttonStyle(.borderedProminent)
-                    Button("Sign Out", role: .destructive) { Task { await session.signOut() } }
+                    Button("Sign Out", role: .destructive) { Task { await manager.signOut(account.id) } }
                 }
-            case .ready(let service):
-                MainView(service: service)
+            } else if manager.readyAccounts.isEmpty {
+                LaunchView()
+            } else {
+                MainView()
             }
         }
         .tint(Theme.brand)
-        .animation(.smooth, value: session.stateID)
+        .animation(.smooth, value: manager.loginStep)
     }
 }
 
@@ -177,7 +179,7 @@ private struct ErrorBanner: View {
 }
 
 struct LoginView: View {
-    @Environment(SessionModel.self) private var session
+    @Environment(AccountManager.self) private var manager
     @State private var username = ""
     @State private var password = ""
     @FocusState private var focused: Field?
@@ -185,7 +187,7 @@ struct LoginView: View {
     private enum Field { case username, password }
 
     var body: some View {
-        AuthScreen(title: "Mail", subtitle: "End-to-end encrypted email,\nwith trackers blocked by default.") {
+        AuthScreen(title: manager.accounts.isEmpty ? "Mail" : "Add Account", subtitle: "End-to-end encrypted email,\nwith trackers blocked by default.") {
             TextField("Email or username", text: $username)
                 .textContentType(.username)
                 .keyboardType(.emailAddress)
@@ -201,23 +203,27 @@ struct LoginView: View {
                 .submitLabel(.go)
                 .onSubmit(signIn)
                 .authField("lock")
-            ErrorBanner(message: session.errorMessage)
-            PrimaryButton(title: "Sign In", isBusy: session.isBusy, isEnabled: !username.isEmpty && !password.isEmpty, action: signIn)
+            ErrorBanner(message: manager.errorMessage)
+            PrimaryButton(title: "Sign In", isBusy: manager.isBusy, isEnabled: !username.isEmpty && !password.isEmpty, action: signIn)
             Label("Your password never leaves this device (SRP).", systemImage: "lock.shield")
                 .font(.caption)
                 .foregroundStyle(.secondary)
+            if !manager.accounts.isEmpty {
+                Button("Cancel", role: .cancel) { manager.cancelLogin() }
+                    .font(.subheadline)
+            }
         }
     }
 
     private func signIn() {
         guard !username.isEmpty, !password.isEmpty else { return }
         focused = nil
-        Task { await session.login(username: username, password: password) }
+        Task { await manager.login(username: username, password: password) }
     }
 }
 
 struct TwoFactorView: View {
-    @Environment(SessionModel.self) private var session
+    @Environment(AccountManager.self) private var manager
     @State private var code = ""
 
     var body: some View {
@@ -232,21 +238,21 @@ struct TwoFactorView: View {
                     code = String(newValue.filter(\.isNumber).prefix(6))
                     if code.count == 6 { submit() }
                 }
-            ErrorBanner(message: session.errorMessage)
-            PrimaryButton(title: "Verify", isBusy: session.isBusy, isEnabled: code.count == 6, action: submit)
-            Button("Cancel", role: .cancel) { Task { await session.signOut() } }
+            ErrorBanner(message: manager.errorMessage)
+            PrimaryButton(title: "Verify", isBusy: manager.isBusy, isEnabled: code.count == 6, action: submit)
+            Button("Cancel", role: .cancel) { manager.cancelLogin() }
                 .font(.subheadline)
         }
     }
 
     private func submit() {
-        guard !session.isBusy else { return }
-        Task { await session.submitTwoFactor(code: code) }
+        guard !manager.isBusy else { return }
+        Task { await manager.submitTwoFactor(code: code) }
     }
 }
 
 struct MailboxPasswordView: View {
-    @Environment(SessionModel.self) private var session
+    @Environment(AccountManager.self) private var manager
     @State private var password = ""
 
     var body: some View {
@@ -254,16 +260,16 @@ struct MailboxPasswordView: View {
             SecureField("Mailbox password", text: $password)
                 .onSubmit(submit)
                 .authField("key")
-            ErrorBanner(message: session.errorMessage)
-            PrimaryButton(title: "Unlock", isBusy: session.isBusy, isEnabled: !password.isEmpty, action: submit)
-            Button("Cancel", role: .cancel) { Task { await session.signOut() } }
+            ErrorBanner(message: manager.errorMessage)
+            PrimaryButton(title: "Unlock", isBusy: manager.isBusy, isEnabled: !password.isEmpty, action: submit)
+            Button("Cancel", role: .cancel) { manager.cancelLogin() }
                 .font(.subheadline)
         }
     }
 
     private func submit() {
         guard !password.isEmpty else { return }
-        Task { await session.submitMailboxPassword(password) }
+        Task { await manager.submitMailboxPassword(password) }
     }
 }
 

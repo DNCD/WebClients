@@ -216,3 +216,156 @@ final class HTMLPrivacyTests: XCTestCase {
         XCTAssertFalse(HTMLPrivacy.isLikelyPixel(#"<img src="x" style="opacity:0.5">"#))
     }
 }
+
+final class SearchQueryTests: XCTestCase {
+    func testParsesOperators() {
+        let query = SearchQuery(#"from:alice@example.com subject:"weekly report" has:attachment is:unread invoice -draft "exact words" after:2026-01-15"#)
+        XCTAssertEqual(query.from, "alice@example.com")
+        XCTAssertEqual(query.subject, "weekly report")
+        XCTAssertEqual(query.hasAttachment, true)
+        XCTAssertEqual(query.unread, true)
+        XCTAssertEqual(query.words, ["invoice"])
+        XCTAssertEqual(query.excluded, ["draft"])
+        XCTAssertEqual(query.phrases, ["exact words"])
+        XCTAssertNotNil(query.after)
+    }
+
+    func testBuildsAPIQuery() {
+        let items = SearchQuery("from:bob to:carol is:starred newer_than:7d report").apiQuery(labelID: "5")
+        let dict = Dictionary(items.map { ($0.name, $0.value ?? "") }, uniquingKeysWith: { a, _ in a })
+        XCTAssertEqual(dict["From"], "bob")
+        XCTAssertEqual(dict["Recipients"], "carol")
+        XCTAssertEqual(dict["Starred"], "1")
+        XCTAssertEqual(dict["Keyword"], "report")
+        XCTAssertNotNil(dict["Begin"])
+    }
+
+    func testBuildsFTSQuery() {
+        XCTAssertEqual(SearchQuery("invoice from:bob -spam").ftsQuery, #""invoice"* AND sender : "bob"* NOT "spam""#)
+        XCTAssertNil(SearchQuery("is:unread").ftsQuery)
+    }
+
+    func testRecognisesSystemMailbox() {
+        XCTAssertEqual(SearchQuery("in:archive hello").systemMailbox, .archive)
+        XCTAssertEqual(SearchQuery("in:all_mail").systemMailbox, .allMail)
+    }
+}
+
+final class SieveTests: XCTestCase {
+    func testGeneratesSieveLikeWebTree() {
+        var filter = SimpleFilter()
+        filter.name = "Newsletters"
+        filter.conditions = [SimpleFilter.Condition(type: .sender, comparator: .ends, value: "@news.example.com")]
+        filter.moveTo = "Reading"
+        filter.markRead = true
+        let sieve = filter.sieve
+        XCTAssertTrue(filter.isValid)
+        XCTAssertTrue(sieve.contains(#"require ["fileinto", "imap4flags"];"#))
+        XCTAssertTrue(sieve.contains(#"if allof (address :all :comparator "i;unicode-casemap" :matches "From" "*@news.example.com")"#))
+        XCTAssertTrue(sieve.contains(#"fileinto "Reading";"#))
+        XCTAssertTrue(sieve.contains(#"addflag "\\Seen";"#))
+        XCTAssertTrue(sieve.contains("keep;"))
+    }
+
+    func testNegationAndEscaping() {
+        var filter = SimpleFilter()
+        filter.name = "x"
+        filter.matching = .any
+        filter.conditions = [
+            SimpleFilter.Condition(type: .subject, comparator: .notContains, value: #"say "hi""#),
+            SimpleFilter.Condition(type: .attachments, hasAttachments: true),
+        ]
+        filter.star = true
+        let sieve = filter.sieve
+        XCTAssertTrue(sieve.contains(#"anyof (not header :comparator "i;unicode-casemap" :contains "Subject" "say \"hi\"", exists "X-Attached")"#))
+        XCTAssertTrue(sieve.contains(#"addflag "\\Flagged";"#))
+    }
+
+    func testRequiresAnAction() {
+        var filter = SimpleFilter()
+        filter.name = "No action"
+        filter.conditions = [SimpleFilter.Condition(value: "a@b.c")]
+        XCTAssertFalse(filter.isValid)
+    }
+}
+
+final class NotificationRuleTests: XCTestCase {
+    func testQuietHoursWrapMidnight() {
+        let calendar = Calendar.current
+        let at = { (hour: Int) in calendar.date(bySettingHour: hour, minute: 30, second: 0, of: Date())! }
+        XCTAssertTrue(NotificationManager.isQuiet(now: at(23), start: 22, end: 7))
+        XCTAssertTrue(NotificationManager.isQuiet(now: at(3), start: 22, end: 7))
+        XCTAssertFalse(NotificationManager.isQuiet(now: at(12), start: 22, end: 7))
+        XCTAssertTrue(NotificationManager.isQuiet(now: at(13), start: 12, end: 14))
+    }
+}
+
+final class MailStoreTests: XCTestCase {
+    private var accountID = ""
+    private var store: MailStore!
+
+    override func setUpWithError() throws {
+        accountID = "test-\(UUID().uuidString)"
+        store = try MailStore(accountID: accountID)
+    }
+
+    override func tearDown() {
+        MailStore.destroy(accountID: accountID)
+    }
+
+    private func message(_ id: String, subject: String, time: TimeInterval, labels: [String] = ["0", "5"], unread: Int = 1) -> MessageMetadata {
+        MessageMetadata(id: id, conversationID: nil, addressID: "a1", subject: subject,
+                        sender: Recipient(name: "Alice Smith", address: "alice@example.com"),
+                        toList: [Recipient(name: "", address: "me@example.com")], ccList: nil,
+                        time: time, size: 1, unread: unread, numAttachments: 0, flags: 0, labelIDs: labels)
+    }
+
+    func testListsByLabelNewestFirst() async throws {
+        try await store.upsert([message("1", subject: "Old", time: 100), message("2", subject: "New", time: 200),
+                                message("3", subject: "Archived", time: 300, labels: ["6", "5"])])
+        let inbox = try await store.messages(labelID: "0", limit: 10)
+        XCTAssertEqual(inbox.map(\.id), ["2", "1"])
+        let unread = try await store.unreadCount(labelID: "0")
+        XCTAssertEqual(unread, 2)
+    }
+
+    func testFullTextSearchFindsBodyText() async throws {
+        let meta = message("m1", subject: "Hello", time: 100)
+        try await store.upsert([meta])
+        let detail = MessageDetail(id: "m1", addressID: "a1", subject: "Hello", sender: meta.sender, toList: meta.toList,
+                                   ccList: nil, bccList: nil, time: 100, body: "", mimeType: "text/html", attachments: nil)
+        try await store.saveBody(detail, content: .html("<p>The <b>quarterly</b> numbers are attached</p>"))
+
+        let byBody = try await store.search(SearchQuery("quarter").ftsQuery!)
+        XCTAssertEqual(byBody.map(\.id), ["m1"])
+        let bySender = try await store.search(SearchQuery("from:alice").ftsQuery!)
+        XCTAssertEqual(bySender.map(\.id), ["m1"])
+        let none = try await store.search(SearchQuery("quarterly -numbers").ftsQuery!)
+        XCTAssertTrue(none.isEmpty)
+
+        let cached = try await store.body(id: "m1")
+        guard case .html(let html)? = cached?.content.content else { return XCTFail("Missing cached body") }
+        XCTAssertTrue(html.contains("quarterly"))
+    }
+
+    func testUpdatesAndRemoves() async throws {
+        try await store.upsert([message("1", subject: "A", time: 1)])
+        try await store.update("1") { $0.unread = 0; $0.labelIDs = ["6"] }
+        let inbox = try await store.messages(labelID: "0", limit: 10)
+        XCTAssertTrue(inbox.isEmpty)
+        try await store.remove(["1"])
+        let archive = try await store.messages(labelID: "6", limit: 10)
+        XCTAssertTrue(archive.isEmpty)
+    }
+
+    func testOutboxRoundTrip() async throws {
+        let item = OutboxItem(fromAddressID: "a1", to: ["x@example.com"], cc: [], bcc: [], subject: "Queued", body: "Hi",
+                              attachments: [OutgoingAttachment(filename: "a.txt", mimeType: "text/plain", data: Data("abc".utf8))])
+        try await store.enqueue(item)
+        let queued = try await store.outbox()
+        XCTAssertEqual(queued, [item])
+        try await store.removeFromOutbox(item.id)
+        let empty = try await store.outbox()
+        XCTAssertTrue(empty.isEmpty)
+    }
+}

@@ -3,8 +3,10 @@ import WebKit
 
 struct MessageView: View {
     @Environment(PrivacyStore.self) private var privacy
-    let model: MailboxModel
+    @Environment(AppSettings.self) private var settings
+    let account: Account
     let messageID: String
+    let mailbox: MailboxSelection
     let onClose: () -> Void
     let onReply: (ComposeView.Prefill) -> Void
 
@@ -20,27 +22,29 @@ struct MessageView: View {
     @State private var errorMessage: String?
     @State private var loadRemoteContent = false
     @State private var showsReport = false
+    @State private var showsAddContact = false
     @State private var htmlHeight: CGFloat = 120
     @State private var imageLoader: ProxyImageLoader?
+    @State private var metadata: MessageMetadata?
 
-    private var service: MailService { model.service }
+    private var notifications: NotificationManager { NotificationManager.shared }
 
     var body: some View {
         Group {
-            if let message, let display {
+            if let message, let display, let service = account.service {
                 ScrollView {
                     VStack(alignment: .leading, spacing: 16) {
                         Text(message.subject.isEmpty ? "(No subject)" : message.subject)
                             .font(.title2.bold())
                             .textSelection(.enabled)
-                        MessageHeader(message: message)
+                        MessageHeader(message: message, isVIP: notifications.isVIP(message.sender.address))
                         PrivacyBanner(report: report,
                                       imagesHidden: report.remoteImageCount > 0 && !loadRemoteContent,
                                       onShowDetails: { showsReport = true },
                                       onLoadImages: { loadRemoteContent = true })
                         bodyView(display)
                         if let attachments = message.attachments, !attachments.isEmpty {
-                            AttachmentList(attachments: attachments)
+                            AttachmentsSection(attachments: attachments, message: message, service: service)
                         }
                     }
                     .padding()
@@ -50,6 +54,9 @@ struct MessageView: View {
                 .sheet(isPresented: $showsReport) {
                     PrivacyReportView(report: report)
                         .presentationDetents([.medium, .large])
+                }
+                .sheet(isPresented: $showsAddContact) {
+                    NewContactView(name: message.sender.name, email: message.sender.address)
                 }
             } else if let errorMessage {
                 ContentUnavailableView("Couldn't Open Message", systemImage: "lock.trianglebadge.exclamationmark",
@@ -79,34 +86,71 @@ struct MessageView: View {
         }
     }
 
+    private func perform(_ action: MailAction, close: Bool) {
+        Task { await account.sync?.perform(action) }
+        if close { onClose() }
+    }
+
     @ToolbarContentBuilder
     private func toolbar(_ message: MessageDetail) -> some ToolbarContent {
         ToolbarItemGroup(placement: .primaryAction) {
             Button {
-                if let content { onReply(.reply(to: message, content: content)) }
+                if let content { onReply(.reply(to: message, content: content, accountID: account.id)) }
             } label: {
                 Label("Reply", systemImage: "arrowshape.turn.up.left")
             }
             Menu {
-                Button("Mark as Unread", systemImage: "envelope.badge") {
-                    model.setUnread(true, for: messageID)
-                    onClose()
-                }
-                if model.mailbox != .archive {
-                    Button("Archive", systemImage: "archivebox") {
-                        model.move(messageID, to: .archive)
-                        onClose()
+                Section {
+                    Button("Reply All", systemImage: "arrowshape.turn.up.left.2") {
+                        if let content { onReply(.reply(to: message, content: content, accountID: account.id, all: true, ownAddresses: account.service?.addresses.map(\.email) ?? [])) }
+                    }
+                    Button("Forward", systemImage: "arrowshape.turn.up.right") {
+                        if let content { onReply(.forward(message, content: content, accountID: account.id)) }
                     }
                 }
-                if model.mailbox == .trash {
-                    Button("Delete Permanently", systemImage: "trash.slash", role: .destructive) {
-                        model.deletePermanently(messageID)
-                        onClose()
+                Section {
+                    Button("Mark as Unread", systemImage: "envelope.badge") {
+                        perform(.markRead(ids: [messageID], read: false), close: true)
                     }
-                } else {
-                    Button("Move to Trash", systemImage: "trash", role: .destructive) {
-                        model.move(messageID, to: .trash)
-                        onClose()
+                    let starred = metadata?.labelIDs?.contains(Mailbox.starred.rawValue) ?? false
+                    Button(starred ? "Unstar" : "Star", systemImage: starred ? "star.slash" : "star") {
+                        perform(starred ? .unlabel(ids: [messageID], labelID: Mailbox.starred.rawValue)
+                                        : .label(ids: [messageID], labelID: Mailbox.starred.rawValue), close: false)
+                        metadata?.labelIDs = starred ? (metadata?.labelIDs ?? []).filter { $0 != Mailbox.starred.rawValue }
+                                                     : (metadata?.labelIDs ?? []) + [Mailbox.starred.rawValue]
+                    }
+                    MoveMenu(labels: account.sync?.labels ?? []) { labelID in
+                        perform(.label(ids: [messageID], labelID: labelID), close: true)
+                    } onLabel: { labelID in
+                        perform(.label(ids: [messageID], labelID: labelID), close: false)
+                    }
+                }
+                Section {
+                    Button(notifications.isVIP(message.sender.address) ? "Remove from VIPs" : "Add Sender to VIPs",
+                           systemImage: "crown") {
+                        notifications.toggleVIP(message.sender.address)
+                    }
+                    Button("Add Sender to Contacts", systemImage: "person.crop.circle.badge.plus") {
+                        showsAddContact = true
+                    }
+                }
+                Section {
+                    if mailbox != .system(.archive) {
+                        Button("Archive", systemImage: "archivebox") {
+                            perform(.label(ids: [messageID], labelID: Mailbox.archive.rawValue), close: true)
+                        }
+                    }
+                    Button("Move to Spam", systemImage: "xmark.octagon") {
+                        perform(.label(ids: [messageID], labelID: Mailbox.spam.rawValue), close: true)
+                    }
+                    if mailbox == .system(.trash) {
+                        Button("Delete Permanently", systemImage: "trash.slash", role: .destructive) {
+                            perform(.delete(ids: [messageID]), close: true)
+                        }
+                    } else {
+                        Button("Move to Trash", systemImage: "trash", role: .destructive) {
+                            perform(.label(ids: [messageID], labelID: Mailbox.trash.rawValue), close: true)
+                        }
                     }
                 }
             } label: {
@@ -116,11 +160,16 @@ struct MessageView: View {
     }
 
     private func load() async {
+        guard let service = account.service else {
+            errorMessage = "This account isn't ready yet."
+            return
+        }
         do {
-            let detail = try await service.message(id: messageID)
-            let decrypted = try service.decryptBody(of: detail)
+            metadata = try? await account.store?.message(id: messageID)
+            let (detail, decrypted) = try await service.loadBody(id: messageID)
             content = decrypted
             imageLoader = ProxyImageLoader(api: service.api)
+            loadRemoteContent = settings.loadImagesAutomatically
 
             var images: [RemoteImage] = []
             switch decrypted {
@@ -136,17 +185,25 @@ struct MessageView: View {
                 display = .html(processed.html)
             }
             message = detail
-            model.setUnread(false, for: messageID)
+            if metadata?.isUnread ?? true {
+                await account.sync?.perform(.markRead(ids: [messageID], read: true))
+            }
             privacy.record(report.summary, for: messageID)
 
-            if !images.isEmpty {
+            if !images.isEmpty, NetworkMonitor.shared.isOnline {
                 report.isScanning = true
                 report.imageTrackers = await TrackerScanner.scan(images, api: service.api)
                 report.isScanning = false
                 privacy.record(report.summary, for: messageID)
+            } else if !images.isEmpty {
+                // Offline: the proxy can't be asked, so count the pixel-shaped images.
+                report.imageTrackers = images.filter(\.isLikelyPixel).map { ImageTracker(provider: TrackerScanner.pixelProvider, url: $0.url) }
+                privacy.record(report.summary, for: messageID)
             }
         } catch {
-            errorMessage = error.localizedDescription
+            errorMessage = error.isTransientNetworkError
+                ? "This message hasn't been downloaded for offline reading yet."
+                : error.localizedDescription
         }
     }
 
@@ -165,8 +222,34 @@ struct MessageView: View {
     }
 }
 
+/// "Move to…" and "Label as…" submenus from the account's folders and labels.
+private struct MoveMenu: View {
+    let labels: [MailLabel]
+    let onMove: (String) -> Void
+    let onLabel: (String) -> Void
+
+    var body: some View {
+        Menu("Move to…", systemImage: "folder") {
+            Button("Inbox", systemImage: "tray") { onMove(Mailbox.inbox.rawValue) }
+            Button("Archive", systemImage: "archivebox") { onMove(Mailbox.archive.rawValue) }
+            ForEach(labels.filter(\.isFolder)) { folder in
+                Button(folder.path ?? folder.name, systemImage: "folder") { onMove(folder.id) }
+            }
+        }
+        let tags = labels.filter { !$0.isFolder }
+        if !tags.isEmpty {
+            Menu("Label as…", systemImage: "tag") {
+                ForEach(tags) { label in
+                    Button(label.name, systemImage: "tag") { onLabel(label.id) }
+                }
+            }
+        }
+    }
+}
+
 private struct MessageHeader: View {
     let message: MessageDetail
+    var isVIP = false
     @State private var expanded = false
 
     var body: some View {
@@ -178,6 +261,9 @@ private struct MessageHeader: View {
                         Text(message.sender.displayName)
                             .font(.headline)
                             .lineLimit(1)
+                        if isVIP {
+                            Image(systemName: "crown.fill").font(.caption).foregroundStyle(.orange)
+                        }
                         Spacer()
                         Text(message.date.mailListFormat)
                             .font(.caption)
@@ -355,37 +441,6 @@ struct PrivacyReportView: View {
                 }
             }
         }
-    }
-}
-
-private struct AttachmentList: View {
-    let attachments: [AttachmentInfo]
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text("\(attachments.count) attachment\(attachments.count == 1 ? "" : "s")")
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(.secondary)
-            ForEach(attachments) { attachment in
-                HStack(spacing: 10) {
-                    Image(systemName: "doc.fill")
-                        .foregroundStyle(Theme.brand)
-                        .frame(width: 32, height: 32)
-                        .background(Theme.brand.opacity(0.12), in: RoundedRectangle(cornerRadius: 8))
-                    VStack(alignment: .leading) {
-                        Text(attachment.name).font(.subheadline).lineLimit(1)
-                        Text(ByteCountFormatter.string(fromByteCount: Int64(attachment.size), countStyle: .file))
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                }
-            }
-            Text("Opening attachments isn't supported yet.")
-                .font(.caption2)
-                .foregroundStyle(.tertiary)
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .card()
     }
 }
 

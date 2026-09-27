@@ -36,6 +36,11 @@ targets:
         CFBundleDisplayName: Mail
         PMAppVersion: $(PM_APP_VERSION)
         UILaunchScreen: {}
+        NSContactsUsageDescription: Suggest recipients from your contacts and save senders as contacts.
+        UIBackgroundModes:
+          - fetch
+        BGTaskSchedulerPermittedIdentifiers:
+          - com.example.mailclient.refresh
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait
           - UIInterfaceOrientationLandscapeLeft

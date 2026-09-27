@@ -65,6 +65,13 @@ actor APIClient {
         onTokensChanged = handler
     }
 
+    /// Called only when the refresh token is rejected (not on a normal sign-out).
+    private var onSessionExpired: (@Sendable () -> Void)?
+
+    func setOnSessionExpired(_ handler: @escaping @Sendable () -> Void) {
+        onSessionExpired = handler
+    }
+
     func send<T: Decodable>(_ request: APIRequest, as type: T.Type = T.self) async throws -> T {
         let data = try await sendRaw(request)
         do {
@@ -165,6 +172,7 @@ actor APIClient {
             return refreshed
         } catch {
             setTokens(nil)
+            onSessionExpired?()
             throw error
         }
     }

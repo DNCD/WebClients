@@ -11,17 +11,37 @@ The API calls are ported from `packages/shared/lib/api/*`. The send pipeline fol
 
 | Area | Supported |
 | --- | --- |
+| Accounts | Several Proton accounts, one-tap switching, **unified inbox** ("All Inboxes") with per-account tags, per-account unread badges |
 | Sign-in | SRP password auth, TOTP two-factor, two-password (mailbox password) accounts, token refresh |
-| Session | Tokens and derived key passphrases kept in the Keychain (device-only); the password is never stored |
-| Reading | Inbox, Drafts, Sent, Starred, Archive, Spam, Trash, All Mail; paging; search; pull to refresh |
-| Messages | Decrypts plain text, HTML and PGP/MIME bodies; HTML is shown with JavaScript off |
-| Tracker protection | Blocks tracking pixels and cleans tracking links (see below); a green shield on the message and in the list shows what was blocked |
-| Actions | Mark read/unread, archive, move to trash, delete from trash |
-| Sending | Plain-text compose and reply. Proton recipients are end-to-end encrypted; other recipients get mail in clear over TLS |
+| Offline | Mail lists, messages and attachments metadata cached in an on-device SQLite store; recent messages (7 days to 1 year, configurable) are downloaded and decrypted for offline reading; read/unread, star, move, label, archive, trash work offline and sync later; mail composed offline waits in the **Outbox** and sends on reconnect |
+| Sync | Incremental sync through the event stream (`core/v5/events`), like the web client; full resync when the server asks |
+| Search | Operators: `from:` `to:` `subject:` `in:` `has:attachment` `is:unread/read/starred` `before:` `after:` `newer_than:7d` `older_than:1y` `"exact phrase"` `-exclude`. Server search for metadata plus **full-text body search** over downloaded mail (SQLite FTS5); works offline |
+| Reading | Plain text, HTML and PGP/MIME; tracker protection (below); Reply, Reply All, Forward; move to folders, apply labels, star, spam |
+| Attachments | Tap to preview (Quick Look), share, **Save to Files** (one or all); attach from Files or Photos when composing (25 MB limit); encrypted like the web client |
+| Contacts | Recipient autocomplete from Proton contacts (cached offline), the iPhone's Contacts (with permission) and recent correspondents; "Add Sender to Contacts" |
+| Filters | Server-side filters like the web's Settings → Filters: list, enable/disable, delete, and create rules (sender/recipient/subject/attachments × contains/is/begins/ends/not → move to folder, label, mark read, star). Rules are compiled to Sieve and validated by the server |
+| Notifications | New-mail notifications with Mark as Read / Archive actions, for Inbox, chosen folders or VIP senders only; quiet hours; hide previews; app badge |
+| Customisation | Light / Dark / System theme; list density (compact, comfortable, spacious); avatars on/off; subject lines; four configurable swipe actions (archive, trash, read, star, spam, move to inbox); delete confirmation; auto-load images |
+| Sending | Plain-text compose; Proton recipients are end-to-end encrypted; others get mail in clear over TLS |
 
-Not implemented yet: attachments (viewing and sending), HTML compose, custom labels and folders,
-conversation view, push notifications, human verification (CAPTCHA) and FIDO2 security keys at sign-in,
-PGP to external recipients' keys, key transparency, and signature verification.
+Not implemented yet: HTML compose, conversation (thread) view, human verification (CAPTCHA) and FIDO2
+security keys at sign-in, PGP to external recipients' keys, key transparency, signature verification,
+creating Proton contacts (senders are saved to iOS Contacts), and instant push.
+
+### About notifications
+
+Proton's push service needs a device registration API that isn't in this repository, so new mail is
+found by the sync loop: every 30 seconds while the app is open, and through iOS background app refresh
+when it isn't. iOS decides when background refresh runs (typically every 15 minutes or more, less
+when the battery is low), so notifications can be delayed.
+
+### About offline storage
+
+The cache lives in `Application Support/Accounts/<id>/mail.sqlite` with iOS data protection
+(`completeUntilFirstUserAuthentication`, so background refresh can sync). Decrypted bodies and the
+outbox are additionally sealed with AES-GCM using a per-account key in the Keychain. The full-text
+index has to hold searchable words from downloaded mail. Signing out of an account deletes its
+database and keys.
 
 ## Tracker protection
 
@@ -72,13 +92,13 @@ encryption.
 
 ```
 MailClient/
-  App/        entry point, config, sign-in state machine (SessionModel)
+  App/        entry point, settings, accounts and sign-in, notifications
   API/        URLSession client (headers, error envelope, token refresh), models, multipart form
   Auth/       SRP login, 2FA, key passphrase derivation
   Crypto/     key unlocking (user key → address keys), send-package encryption
-  Mail/       message list/read/actions/send, minimal MIME parser
+  Mail/       mail API, sync engine (events, outbox, offline actions), search, filters, contacts, MIME
   Privacy/    link cleaning, HTML rewriting, tracker lookup, proxy image loader
-  Storage/    Keychain
+  Storage/    Keychain, SQLite wrapper, per-account offline store (FTS5)
   Views/      SwiftUI screens
 MailClientTests/
 ```

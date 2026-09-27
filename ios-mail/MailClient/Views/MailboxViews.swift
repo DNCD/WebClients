@@ -1,179 +1,228 @@
 import SwiftUI
 
-/// List state for one mailbox, shared by the list and the open message so actions in either stay in sync.
-@MainActor
-@Observable
-final class MailboxModel {
-    let service: MailService
-    let mailbox: Mailbox
-
-    private(set) var messages: [MessageMetadata] = []
-    private(set) var total = 0
-    private(set) var isLoading = false
-    var errorMessage: String?
-    var search = ""
-    private var page = 0
-
-    init(service: MailService, mailbox: Mailbox) {
-        self.service = service
-        self.mailbox = mailbox
-    }
-
-    var canLoadMore: Bool { messages.count < total }
-
-    func reload() async { await load(page: 0) }
-
-    func loadMore() async {
-        guard canLoadMore else { return }
-        await load(page: page + 1)
-    }
-
-    private func load(page: Int) async {
-        guard !isLoading else { return }
-        isLoading = true
-        defer { isLoading = false }
-        do {
-            let response = try await service.messages(in: mailbox, page: page, keyword: search)
-            messages = page == 0 ? response.messages : messages + response.messages
-            total = response.total
-            self.page = page
-            errorMessage = nil
-        } catch {
-            errorMessage = error.localizedDescription
-        }
-    }
-
-    func setUnread(_ unread: Bool, for id: String, remote: Bool = true) {
-        if let index = messages.firstIndex(where: { $0.id == id }) {
-            messages[index].unread = unread ? 1 : 0
-        }
-        guard remote else { return }
-        run { try await self.service.markRead([id], read: !unread) }
-    }
-
-    func move(_ id: String, to destination: Mailbox) {
-        remove(id)
-        run { try await self.service.move([id], to: destination) }
-    }
-
-    func deletePermanently(_ id: String) {
-        remove(id)
-        run { try await self.service.delete([id]) }
-    }
-
-    private func remove(_ id: String) {
-        guard messages.contains(where: { $0.id == id }) else { return }
-        messages.removeAll { $0.id == id }
-        total -= 1
-    }
-
-    private func run(_ work: @escaping () async throws -> Void) {
-        Task {
-            do {
-                try await work()
-            } catch {
-                errorMessage = error.localizedDescription
-                await reload()
-            }
-        }
-    }
-}
-
 struct MainView: View {
-    @Environment(SessionModel.self) private var session
-    @Environment(PrivacyStore.self) private var privacy
-    let service: MailService
+    @Environment(AccountManager.self) private var manager
+    @Environment(AppSettings.self) private var settings
+    @Environment(NetworkMonitor.self) private var network
 
-    @State private var mailbox: Mailbox? = .inbox
+    @State private var selection: MailboxSelection? = .system(.inbox)
     @State private var model: MailboxModel?
-    @State private var selectedMessageID: String?
+    @State private var selectedItemID: String?
     @State private var compose: ComposeView.Prefill?
+    @State private var showsSettings = false
+
+    private var notifications: NotificationManager { NotificationManager.shared }
+
+    /// Accounts the current mailbox shows: all of them for the unified inbox, else the active one.
+    private var mailboxAccounts: [Account] {
+        if selection == .system(.inbox) { return manager.unifiedAccounts }
+        return manager.activeAccount.map { [$0] } ?? []
+    }
+
+    private var modelKey: String {
+        "\(String(describing: selection))|\(mailboxAccounts.map(\.id).joined(separator: ","))"
+    }
 
     var body: some View {
         NavigationSplitView {
-            SidebarView(service: service, selection: $mailbox) {
-                privacy.clear()
-                Task { await session.signOut() }
-            }
+            SidebarView(selection: $selection, showsSettings: $showsSettings)
         } content: {
-            if let model {
-                MessageListView(model: model, selection: $selectedMessageID)
-                    .overlay(alignment: .bottomTrailing) {
-                        ComposeButton { compose = ComposeView.Prefill() }
-                            .padding(20)
-                    }
+            Group {
+                if selection == .outbox, let account = manager.activeAccount {
+                    OutboxView(account: account)
+                } else if let model {
+                    MessageListView(model: model, selection: $selectedItemID)
+                } else {
+                    ContentUnavailableView("Loading…", systemImage: "tray")
+                }
+            }
+            .safeAreaInset(edge: .top, spacing: 0) {
+                if !network.isOnline { OfflineBanner() }
+            }
+            .overlay(alignment: .bottomTrailing) {
+                ComposeButton { compose = ComposeView.Prefill() }
+                    .padding(20)
             }
         } detail: {
-            if let model, let selectedMessageID {
-                MessageView(model: model, messageID: selectedMessageID, onClose: { self.selectedMessageID = nil }) { prefill in
+            if let selectedItemID, let parts = Self.split(selectedItemID), let account = manager.account(parts.accountID) {
+                MessageView(account: account, messageID: parts.messageID, mailbox: selection ?? .system(.inbox),
+                            onClose: { self.selectedItemID = nil }) { prefill in
                     compose = prefill
                 }
-                .id(selectedMessageID)
+                .id(selectedItemID)
             } else {
                 ContentUnavailableView("No Message Selected", systemImage: "envelope.open",
                                        description: Text("Pick a message to read it."))
             }
         }
-        .tint(Theme.brand)
         .sheet(item: $compose) { prefill in
-            ComposeView(service: service, prefill: prefill)
+            if let account = manager.account(prefill.accountID ?? "") ?? manager.activeAccount {
+                ComposeView(account: account, prefill: prefill)
+            }
         }
-        .onChange(of: mailbox, initial: true) { _, newValue in
-            selectedMessageID = nil
-            model = newValue.map { MailboxModel(service: service, mailbox: $0) }
+        .sheet(isPresented: $showsSettings) {
+            SettingsView()
         }
+        .onChange(of: modelKey, initial: true) {
+            selectedItemID = nil
+            if let selection, selection != .outbox, !mailboxAccounts.isEmpty {
+                model = MailboxModel(accounts: mailboxAccounts, selection: selection)
+            }
+        }
+        .onChange(of: notifications.pendingOpen?.messageID) {
+            guard let open = notifications.pendingOpen else { return }
+            manager.activate(open.accountID)
+            selection = .system(.inbox)
+            selectedItemID = open.accountID + ":" + open.messageID
+            notifications.pendingOpen = nil
+        }
+        .onChange(of: manager.totalUnread) { _, count in
+            notifications.setBadge(count)
+        }
+    }
+
+    static func split(_ id: String) -> (accountID: String, messageID: String)? {
+        let parts = id.split(separator: ":", maxSplits: 1).map(String.init)
+        return parts.count == 2 ? (parts[0], parts[1]) : nil
+    }
+}
+
+private struct OfflineBanner: View {
+    var body: some View {
+        Label("Offline — showing downloaded mail. Changes will sync when you're back online.", systemImage: "wifi.slash")
+            .font(.caption.weight(.medium))
+            .foregroundStyle(.white)
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 6)
+            .padding(.horizontal, 12)
+            .background(Color.orange.gradient)
     }
 }
 
 struct SidebarView: View {
-    let service: MailService
-    @Binding var selection: Mailbox?
-    let onSignOut: () -> Void
+    @Environment(AccountManager.self) private var manager
+    @Binding var selection: MailboxSelection?
+    @Binding var showsSettings: Bool
+
+    private var account: Account? { manager.activeAccount }
+    private var labels: [MailLabel] { account?.sync?.labels ?? [] }
 
     var body: some View {
         List(selection: $selection) {
-            Section {
-                ForEach(Mailbox.allCases) { mailbox in
-                    Label {
-                        Text(mailbox.title)
-                    } icon: {
-                        Image(systemName: mailbox.systemImage)
-                            .foregroundStyle(mailbox.tint)
+            if manager.accounts.count > 1 {
+                Section {
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 14) {
+                            ForEach(manager.accounts) { account in
+                                AccountChip(account: account, isActive: account.id == manager.activeAccount?.id) {
+                                    withAnimation(.snappy) { manager.activate(account.id) }
+                                }
+                            }
+                        }
+                        .padding(.vertical, 4)
                     }
-                    .tag(mailbox)
+                    .listRowInsets(EdgeInsets(top: 0, leading: 12, bottom: 0, trailing: 12))
                 }
             }
-            Section("Protection") {
-                Label {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("Tracker protection is on")
-                        Text("Remote images load only through Proton's proxy; tracking links are cleaned.")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
+
+            Section {
+                ForEach(Mailbox.allCases) { mailbox in
+                    row(.system(mailbox), title: mailbox == .inbox && manager.unifiedAccounts.count > 1 ? "All Inboxes" : mailbox.title,
+                        icon: mailbox.systemImage, tint: mailbox.tint, count: unread(mailbox.rawValue))
+                }
+                if let outbox = account?.sync?.outbox, !outbox.isEmpty {
+                    row(.outbox, title: "Outbox", icon: "tray.and.arrow.up", tint: .orange, count: outbox.count)
+                }
+            }
+
+            let folders = labels.filter(\.isFolder).sorted { ($0.order ?? 0) < ($1.order ?? 0) }
+            if !folders.isEmpty {
+                Section("Folders") {
+                    ForEach(folders) { folder in
+                        row(.custom(folder), title: folder.path ?? folder.name, icon: "folder.fill",
+                            tint: Color(hex: folder.color) ?? .secondary, count: unread(folder.id))
                     }
-                } icon: {
-                    Image(systemName: "checkmark.shield.fill").foregroundStyle(Theme.protection)
+                }
+            }
+            let tags = labels.filter { !$0.isFolder }.sorted { ($0.order ?? 0) < ($1.order ?? 0) }
+            if !tags.isEmpty {
+                Section("Labels") {
+                    ForEach(tags) { label in
+                        row(.custom(label), title: label.name, icon: "tag.fill",
+                            tint: Color(hex: label.color) ?? .secondary, count: unread(label.id))
+                    }
                 }
             }
         }
         .listStyle(.sidebar)
-        .navigationTitle("Mail")
+        .navigationTitle(account?.displayName.isEmpty == false ? account!.displayName : "Mail")
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
-                Menu {
-                    Section("Addresses") {
-                        ForEach(service.addresses) { Text($0.email) }
-                    }
-                    Button("Sign Out", systemImage: "rectangle.portrait.and.arrow.right", role: .destructive, action: onSignOut)
-                } label: {
-                    if let address = service.addresses.first {
-                        AvatarView(name: address.displayName ?? "", address: address.email, size: 30)
+                Button { showsSettings = true } label: {
+                    if let account {
+                        AvatarView(name: account.displayName, address: account.email, size: 30)
                     } else {
-                        Image(systemName: "person.crop.circle")
+                        Image(systemName: "gearshape")
                     }
                 }
+                .accessibilityLabel("Settings")
             }
         }
+    }
+
+    private func unread(_ labelID: String) -> Int {
+        let accounts = labelID == Mailbox.inbox.rawValue ? manager.unifiedAccounts : (account.map { [$0] } ?? [])
+        return accounts.reduce(0) { $0 + ($1.sync?.unreadCounts[labelID] ?? 0) }
+    }
+
+    private func row(_ value: MailboxSelection, title: String, icon: String, tint: Color, count: Int) -> some View {
+        Label {
+            HStack {
+                Text(title).lineLimit(1)
+                Spacer()
+                if count > 0 {
+                    Text("\(count)")
+                        .font(.caption.weight(.semibold).monospacedDigit())
+                        .foregroundStyle(.secondary)
+                }
+            }
+        } icon: {
+            Image(systemName: icon).foregroundStyle(tint)
+        }
+        .tag(value)
+    }
+}
+
+private struct AccountChip: View {
+    let account: Account
+    let isActive: Bool
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            VStack(spacing: 4) {
+                AvatarView(name: account.displayName, address: account.email, size: 40)
+                    .overlay(Circle().stroke(isActive ? Theme.brand : .clear, lineWidth: 2.5).padding(-3))
+                    .overlay(alignment: .topTrailing) {
+                        let unread = account.sync?.unreadCounts[Mailbox.inbox.rawValue] ?? 0
+                        if unread > 0 {
+                            Text(unread > 99 ? "99+" : "\(unread)")
+                                .font(.system(size: 10, weight: .bold))
+                                .foregroundStyle(.white)
+                                .padding(.horizontal, 4)
+                                .background(Color.red, in: Capsule())
+                                .offset(x: 6, y: -4)
+                        }
+                    }
+                Text(account.email.split(separator: "@").first.map(String.init) ?? account.email)
+                    .font(.caption2)
+                    .lineLimit(1)
+                    .frame(maxWidth: 64)
+                    .foregroundStyle(isActive ? .primary : .secondary)
+            }
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Switch to \(account.email)")
     }
 }
 
@@ -194,8 +243,10 @@ struct ComposeButton: View {
 }
 
 struct MessageListView: View {
+    @Environment(AppSettings.self) private var settings
     @Bindable var model: MailboxModel
     @Binding var selection: String?
+    @State private var pendingDelete: MailItem?
 
     var body: some View {
         List(selection: $selection) {
@@ -205,90 +256,160 @@ struct MessageListView: View {
                     .foregroundStyle(.red)
                     .listRowSeparator(.hidden)
             }
-            ForEach(model.messages) { message in
-                MessageRow(message: message)
-                    .tag(message.id)
-                    .swipeActions(edge: .trailing) { trailingActions(for: message) }
-                    .swipeActions(edge: .leading) {
-                        Button {
-                            model.setUnread(!message.isUnread, for: message.id)
-                        } label: {
-                            Label(message.isUnread ? "Read" : "Unread", systemImage: message.isUnread ? "envelope.open.fill" : "envelope.badge.fill")
-                        }
-                        .tint(.blue)
+            if model.searchResults != nil {
+                SearchSummary(model: model)
+            }
+            ForEach(model.visibleItems) { item in
+                MessageRow(message: item.message,
+                           accountEmail: model.isUnified ? model.account(for: item)?.email : nil)
+                    .tag(item.id)
+                    .swipeActions(edge: .leading, allowsFullSwipe: true) {
+                        swipeButton(settings.leadingSwipe, item)
+                        swipeButton(settings.leadingSwipeSecondary, item)
+                    }
+                    .swipeActions(edge: .trailing, allowsFullSwipe: true) {
+                        swipeButton(settings.trailingSwipe, item)
+                        swipeButton(settings.trailingSwipeSecondary, item)
                     }
                     .onAppear {
-                        if message.id == model.messages.last?.id {
+                        if model.searchResults == nil, item.id == model.items.last?.id {
                             Task { await model.loadMore() }
                         }
                     }
             }
-            if model.isLoading {
+            if model.isLoading || model.isSearching {
                 ProgressView()
                     .frame(maxWidth: .infinity)
                     .listRowSeparator(.hidden)
             }
         }
         .listStyle(.plain)
-        .navigationTitle(model.mailbox.title)
-        .searchable(text: $model.search, prompt: "Search mail")
-        .onSubmit(of: .search) { Task { await model.reload() } }
-        .onChange(of: model.search) { _, newValue in
-            if newValue.isEmpty { Task { await model.reload() } }
+        .navigationTitle(model.isUnified && model.selection == .system(.inbox) ? "All Inboxes" : model.selection.title)
+        .searchable(text: $model.searchText, prompt: "Search — try from: has:attachment")
+        .searchSuggestions {
+            if model.searchText.isEmpty {
+                ForEach(SearchHint.all, id: \.self) { hint in
+                    Label(hint.label, systemImage: hint.icon).searchCompletion(hint.token)
+                }
+            }
         }
-        .refreshable { await model.reload() }
-        .task(id: ObjectIdentifier(model)) { await model.reload() }
+        .onSubmit(of: .search) { Task { await model.search() } }
+        .onChange(of: model.searchText) { _, newValue in
+            if newValue.isEmpty { model.clearSearch() }
+        }
+        .refreshable { await model.refresh() }
+        .task { await model.refresh() }
+        .onChange(of: model.revision) {
+            Task { await model.reloadFromStore() }
+        }
         .onChange(of: selection) { _, id in
-            // Opening a message marks it read on the server (MessageView); mirror that here.
-            if let id { model.setUnread(false, for: id, remote: false) }
+            // Opening a message marks it read (MessageView); reflect it in the list right away.
+            guard let id, let item = model.visibleItems.first(where: { $0.id == id }), item.message.isUnread else { return }
+            model.perform(.markRead(ids: [item.message.id], read: true), accountID: item.accountID)
+        }
+        .confirmationDialog("Delete this message permanently?", isPresented: .init(
+            get: { pendingDelete != nil }, set: { if !$0 { pendingDelete = nil } }), titleVisibility: .visible) {
+            Button("Delete", role: .destructive) {
+                if let pendingDelete { model.perform(.trash, on: pendingDelete) }
+                pendingDelete = nil
+            }
         }
         .overlay {
-            if !model.isLoading, model.messages.isEmpty, model.errorMessage == nil {
-                ContentUnavailableView(model.search.isEmpty ? "No Messages" : "No Results",
-                                       systemImage: model.search.isEmpty ? model.mailbox.systemImage : "magnifyingglass")
+            if !model.isLoading, !model.isSearching, model.visibleItems.isEmpty, model.errorMessage == nil {
+                ContentUnavailableView(model.searchResults == nil ? "No Messages" : "No Results",
+                                       systemImage: model.searchResults == nil ? model.selection.systemImage : "magnifyingglass")
             }
         }
     }
 
     @ViewBuilder
-    private func trailingActions(for message: MessageMetadata) -> some View {
-        if model.mailbox == .trash {
-            Button(role: .destructive) { model.deletePermanently(message.id) } label: {
-                Label("Delete", systemImage: "trash.slash.fill")
+    private func swipeButton(_ action: AppSettings.SwipeAction, _ item: MailItem) -> some View {
+        if action != .none {
+            let permanent = action == .trash && model.selection == .system(.trash)
+            Button(role: model.removesFromList(action) ? .destructive : nil) {
+                if permanent && settings.confirmDelete {
+                    pendingDelete = item
+                } else {
+                    model.perform(action, on: item)
+                }
+            } label: {
+                Label(title(action, item), systemImage: icon(action, item))
             }
-        } else {
-            Button(role: .destructive) { model.move(message.id, to: .trash) } label: {
-                Label("Trash", systemImage: "trash.fill")
-            }
+            .tint(action.tint)
         }
-        if model.mailbox != .archive {
-            Button { model.move(message.id, to: .archive) } label: {
-                Label("Archive", systemImage: "archivebox.fill")
-            }
-            .tint(.indigo)
+    }
+
+    private func title(_ action: AppSettings.SwipeAction, _ item: MailItem) -> String {
+        switch action {
+        case .toggleRead: return item.message.isUnread ? "Read" : "Unread"
+        case .star: return model.isStarred(item) ? "Unstar" : "Star"
+        case .trash where model.selection == .system(.trash): return "Delete"
+        default: return action.title
+        }
+    }
+
+    private func icon(_ action: AppSettings.SwipeAction, _ item: MailItem) -> String {
+        switch action {
+        case .toggleRead: return item.message.isUnread ? "envelope.open.fill" : "envelope.badge.fill"
+        case .star: return model.isStarred(item) ? "star.slash.fill" : "star.fill"
+        default: return action.systemImage
         }
     }
 }
 
+private struct SearchSummary: View {
+    let model: MailboxModel
+
+    var body: some View {
+        let count = model.searchResults?.count ?? 0
+        Label {
+            Text("\(count) result\(count == 1 ? "" : "s")")
+                + Text(model.searchUsedLocalIndexOnly ? " · offline, searched downloaded mail" : " · includes message bodies you've downloaded")
+                .foregroundStyle(.secondary)
+        } icon: {
+            Image(systemName: "text.magnifyingglass")
+        }
+        .font(.caption)
+        .listRowSeparator(.hidden)
+    }
+}
+
+private struct SearchHint: Hashable {
+    let label: String
+    let token: String
+    let icon: String
+
+    static let all = [
+        SearchHint(label: "From someone", token: "from:", icon: "person"),
+        SearchHint(label: "Sent to someone", token: "to:", icon: "person.2"),
+        SearchHint(label: "Subject contains", token: "subject:", icon: "textformat"),
+        SearchHint(label: "Has attachments", token: "has:attachment ", icon: "paperclip"),
+        SearchHint(label: "Unread", token: "is:unread ", icon: "envelope.badge"),
+        SearchHint(label: "Starred", token: "is:starred ", icon: "star"),
+        SearchHint(label: "Last 7 days", token: "newer_than:7d ", icon: "calendar"),
+        SearchHint(label: "Before a date", token: "before:2026-01-01 ", icon: "calendar.badge.clock"),
+        SearchHint(label: "Exact phrase", token: "\"", icon: "quote.opening"),
+        SearchHint(label: "Exclude a word", token: "-", icon: "minus.circle"),
+    ]
+}
+
 struct MessageRow: View {
     @Environment(PrivacyStore.self) private var privacy
+    @Environment(AppSettings.self) private var settings
     let message: MessageMetadata
+    var accountEmail: String?
 
     private var isStarred: Bool { message.labelIDs?.contains(Mailbox.starred.rawValue) ?? false }
 
     var body: some View {
         HStack(alignment: .top, spacing: 12) {
-            AvatarView(name: message.sender.name, address: message.sender.address)
-                .overlay(alignment: .topLeading) {
-                    if message.isUnread {
-                        Circle()
-                            .fill(Theme.brand)
-                            .frame(width: 11, height: 11)
-                            .overlay(Circle().stroke(Color(.systemBackground), lineWidth: 2))
-                            .offset(x: -3, y: -3)
-                    }
-                }
-            VStack(alignment: .leading, spacing: 3) {
+            if settings.showsAvatars {
+                AvatarView(name: message.sender.name, address: message.sender.address, size: settings.density.avatarSize)
+                    .overlay(alignment: .topLeading) { unreadDot.offset(x: -3, y: -3) }
+            } else {
+                unreadDot.padding(.top, 6)
+            }
+            VStack(alignment: .leading, spacing: settings.density == .compact ? 1 : 3) {
                 HStack(alignment: .firstTextBaseline) {
                     Text(message.sender.displayName)
                         .font(.body.weight(message.isUnread ? .semibold : .regular))
@@ -301,8 +422,16 @@ struct MessageRow: View {
                 Text(message.subject.isEmpty ? "(No subject)" : message.subject)
                     .font(.subheadline.weight(message.isUnread ? .medium : .regular))
                     .foregroundStyle(message.isUnread ? .primary : .secondary)
-                    .lineLimit(2)
+                    .lineLimit(settings.previewLines)
                 HStack(spacing: 6) {
+                    if let accountEmail {
+                        Text(accountEmail)
+                            .font(.caption2)
+                            .padding(.horizontal, 5)
+                            .padding(.vertical, 1)
+                            .background(Color(.tertiarySystemFill), in: Capsule())
+                            .lineLimit(1)
+                    }
                     if let summary = privacy.summary(for: message.id), summary.total > 0 {
                         TrackerShield(summary: summary)
                     }
@@ -312,12 +441,60 @@ struct MessageRow: View {
                     if isStarred {
                         Image(systemName: "star.fill").foregroundStyle(.yellow)
                     }
+                    if NotificationManager.shared.isVIP(message.sender.address) {
+                        Image(systemName: "crown.fill").foregroundStyle(.orange)
+                    }
                 }
                 .font(.caption)
                 .foregroundStyle(.secondary)
             }
         }
-        .padding(.vertical, 6)
+        .padding(.vertical, settings.density.rowPadding)
+    }
+
+    @ViewBuilder
+    private var unreadDot: some View {
+        Circle()
+            .fill(message.isUnread ? Theme.brand : .clear)
+            .frame(width: 11, height: 11)
+            .overlay(Circle().stroke(message.isUnread ? Color(.systemBackground) : .clear, lineWidth: 2))
+    }
+}
+
+struct OutboxView: View {
+    let account: Account
+
+    var body: some View {
+        List {
+            if let sync = account.sync {
+                ForEach(sync.outbox) { item in
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(item.to.joined(separator: ", ")).font(.subheadline.weight(.semibold)).lineLimit(1)
+                        Text(item.subject.isEmpty ? "(No subject)" : item.subject).lineLimit(1)
+                        Label(item.lastError ?? "Waiting for a connection", systemImage: item.lastError == nil ? "clock" : "exclamationmark.triangle")
+                            .font(.caption)
+                            .foregroundStyle(item.lastError == nil ? .secondary : Color.red)
+                    }
+                    .swipeActions {
+                        Button("Discard", role: .destructive) {
+                            Task { await sync.removeFromOutbox(item.id) }
+                        }
+                    }
+                }
+            }
+        }
+        .navigationTitle("Outbox")
+        .toolbar {
+            Button("Send Now") {
+                Task { await account.sync?.flushOutbox() }
+            }
+        }
+        .overlay {
+            if account.sync?.outbox.isEmpty ?? true {
+                ContentUnavailableView("Outbox Empty", systemImage: "tray.and.arrow.up",
+                                       description: Text("Mail you send while offline waits here."))
+            }
+        }
     }
 }
 
@@ -333,5 +510,15 @@ extension Mailbox {
         case .trash: return .red
         case .allMail: return .purple
         }
+    }
+}
+
+extension Color {
+    /// Label colours from the API are "#RRGGBB".
+    init?(hex: String?) {
+        guard var hex = hex?.trimmingCharacters(in: .whitespaces), !hex.isEmpty else { return nil }
+        if hex.hasPrefix("#") { hex.removeFirst() }
+        guard hex.count == 6, let value = UInt32(hex, radix: 16) else { return nil }
+        self.init(red: Double((value >> 16) & 0xFF) / 255, green: Double((value >> 8) & 0xFF) / 255, blue: Double(value & 0xFF) / 255)
     }
 }

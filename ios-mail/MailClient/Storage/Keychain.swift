@@ -44,28 +44,3 @@ enum Keychain {
         SecItemDelete(query as CFDictionary)
     }
 }
-
-/// What we persist between launches: API tokens and derived key passphrases (never the password).
-enum SessionStore {
-    private static let tokensKey = "session.tokens"
-    private static let passphrasesKey = "session.passphrases"
-
-    static var tokens: SessionTokens? {
-        get { Keychain.load(SessionTokens.self, for: tokensKey) }
-        set {
-            if let newValue { try? Keychain.save(newValue, for: tokensKey) } else { Keychain.delete(tokensKey) }
-        }
-    }
-
-    static var passphrases: [String: String]? {
-        get { Keychain.load([String: String].self, for: passphrasesKey) }
-        set {
-            if let newValue { try? Keychain.save(newValue, for: passphrasesKey) } else { Keychain.delete(passphrasesKey) }
-        }
-    }
-
-    static func clear() {
-        tokens = nil
-        passphrases = nil
-    }
-}

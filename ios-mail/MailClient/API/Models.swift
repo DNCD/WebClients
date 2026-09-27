@@ -134,7 +134,7 @@ struct MessagesResponse: Decodable {
     let messages: [MessageMetadata]
 }
 
-struct MessageMetadata: Decodable, Identifiable, Hashable {
+struct MessageMetadata: Codable, Identifiable, Hashable {
     let id: String
     let conversationID: String?
     let addressID: String
@@ -147,7 +147,7 @@ struct MessageMetadata: Decodable, Identifiable, Hashable {
     var unread: Int
     let numAttachments: Int?
     let flags: Int?
-    let labelIDs: [String]?
+    var labelIDs: [String]?
 
     var isUnread: Bool { unread == 1 }
     var date: Date { Date(timeIntervalSince1970: time) }
@@ -157,7 +157,7 @@ struct MessageResponse: Decodable {
     let message: MessageDetail
 }
 
-struct MessageDetail: Decodable, Identifiable {
+struct MessageDetail: Codable, Identifiable {
     let id: String
     let addressID: String
     let subject: String
@@ -173,11 +173,32 @@ struct MessageDetail: Decodable, Identifiable {
     var date: Date { Date(timeIntervalSince1970: time) }
 }
 
-struct AttachmentInfo: Decodable, Identifiable {
+struct AttachmentInfo: Codable, Identifiable, Hashable {
     let id: String
     let name: String
     let size: Int
     let mimeType: String
+    /// Session key packet for the attachment, encrypted to the address key (base64).
+    let keyPackets: String?
+    let signature: String?
+}
+
+/// Custom label (Type 1) or folder (Type 3), from `core/v4/labels`.
+struct MailLabel: Codable, Identifiable, Hashable {
+    let id: String
+    let name: String
+    let color: String?
+    let type: Int
+    let parentID: String?
+    let order: Int?
+    /// Full path for nested folders ("Work/Clients"); Sieve `fileinto` uses it.
+    let path: String?
+
+    var isFolder: Bool { type == 3 }
+}
+
+struct LabelsResponse: Decodable {
+    let labels: [MailLabel]
 }
 
 /// Mailbox system label IDs (`MAILBOX_LABEL_IDS` in `packages/shared/lib/constants.ts`).
