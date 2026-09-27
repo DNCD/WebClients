@@ -104,7 +104,7 @@ final class NotificationManager: NSObject {
         }
     }
 
-    static func isQuiet(now: Date, start: Int, end: Int) -> Bool {
+    nonisolated static func isQuiet(now: Date, start: Int, end: Int) -> Bool {
         let hour = Calendar.current.component(.hour, from: now)
         return start <= end ? (hour >= start && hour < end) : (hour >= start || hour < end)
     }
