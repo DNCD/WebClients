@@ -3,6 +3,7 @@ import SwiftUI
 @main
 struct MailClientApp: App {
     @State private var session = SessionModel()
+    @State private var privacy = PrivacyStore()
 
     init() {
         Crypto.setUp()
@@ -12,6 +13,7 @@ struct MailClientApp: App {
         WindowGroup {
             RootView()
                 .environment(session)
+                .environment(privacy)
                 .task { await session.restore() }
         }
     }

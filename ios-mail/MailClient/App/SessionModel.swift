@@ -15,6 +15,18 @@ final class SessionModel {
     }
 
     private(set) var state: State = .launching
+
+    /// Identifies the current screen, for animating between sign-in steps.
+    var stateID: String {
+        switch state {
+        case .launching: return "launching"
+        case .signedOut: return "signedOut"
+        case .twoFactor: return "twoFactor"
+        case .mailboxPassword: return "mailboxPassword"
+        case .loadFailed: return "loadFailed"
+        case .ready: return "ready"
+        }
+    }
     var errorMessage: String?
     private(set) var isBusy = false
 

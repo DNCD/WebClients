@@ -28,7 +28,7 @@ jobs:
         run: xcodegen generate
 
       - name: Resolve packages
-        run: xcodebuild -resolvePackageDependencies -project MailClient.xcodeproj -scheme MailClient
+        run: xcodebuild -resolvePackageDependencies -project MailClient.xcodeproj -scheme MailClient -skipPackagePluginValidation -skipMacroValidation
 
       - name: Build and test
         run: |
@@ -39,6 +39,8 @@ jobs:
             -project MailClient.xcodeproj \
             -scheme MailClient \
             -destination "id=$DEVICE_ID" \
+            -skipPackagePluginValidation \
+            -skipMacroValidation \
             CODE_SIGNING_ALLOWED=NO > build.log 2>&1 || {
               grep -E "error:|\*\* (BUILD|TEST) FAILED|Test Case .* failed|XCTAssert" build.log | head -100
               tail -40 build.log

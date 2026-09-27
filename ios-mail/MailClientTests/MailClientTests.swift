@@ -151,3 +151,68 @@ final class CryptoTests: XCTestCase {
         XCTAssertEqual(try sessionKey.decrypt(dataPacket).getString(), "Hello there")
     }
 }
+
+final class LinkCleanerTests: XCTestCase {
+    func testRemovesTrackingParametersAndKeepsOthers() throws {
+        let link = try XCTUnwrap(LinkCleaner.clean("https://shop.example.com/item?id=42&utm_source=news&utm_medium=email&fbclid=abc&q=a%26b#top"))
+        XCTAssertEqual(link.cleaned, "https://shop.example.com/item?id=42&q=a%26b#top")
+        XCTAssertEqual(Set(link.removed), ["utm_source", "utm_medium", "fbclid"])
+    }
+
+    func testLeavesCleanAndNonHTTPLinksAlone() {
+        XCTAssertNil(LinkCleaner.clean("https://example.com/page?id=1"))
+        XCTAssertNil(LinkCleaner.clean("mailto:someone@example.com?subject=utm_source"))
+    }
+
+    func testDropsQueryWhenOnlyTrackingParameters() {
+        XCTAssertEqual(LinkCleaner.clean("https://example.com/?utm_campaign=x")?.cleaned, "https://example.com/")
+    }
+
+    func testCleansLinksInPlainText() {
+        let result = LinkCleaner.cleanText("Read https://example.com/a?utm_source=x and https://example.com/b")
+        XCTAssertEqual(result.text, "Read https://example.com/a and https://example.com/b")
+        XCTAssertEqual(result.cleaned.count, 1)
+    }
+}
+
+final class HTMLPrivacyTests: XCTestCase {
+    func testRoutesImagesThroughProxyAndFlagsPixels() {
+        let html = """
+        <p><img src="https://cdn.example.com/logo.png" srcset="https://cdn.example.com/logo@2x.png 2x" alt="Logo">
+        <img width="1" height="1" src="https://track.example.net/open?u=1&amp;m=2">
+        <img src="data:image/png;base64,AAAA"></p>
+        <div style="background-image:url('https://cdn.example.com/bg.jpg')"></div>
+        """
+        let result = HTMLPrivacy.process(html)
+
+        XCTAssertFalse(result.html.contains(#"src="https://"#))
+        XCTAssertFalse(result.html.contains("srcset"))
+        XCTAssertFalse(result.html.contains("url('https://"))
+        XCTAssertTrue(result.html.contains("data:image/png;base64,AAAA"))
+        XCTAssertEqual(result.remoteImages, [
+            RemoteImage(url: "https://cdn.example.com/logo.png", isLikelyPixel: false),
+            RemoteImage(url: "https://track.example.net/open?u=1&m=2", isLikelyPixel: true),
+            RemoteImage(url: "https://cdn.example.com/bg.jpg", isLikelyPixel: false),
+        ])
+    }
+
+    func testProxyURLRoundTrips() throws {
+        let remote = "https://track.example.net/open?u=1&m=2"
+        let components = try XCTUnwrap(URLComponents(string: HTMLPrivacy.proxyURL(for: remote)))
+        XCTAssertEqual(components.scheme, "pm-proxy")
+        XCTAssertEqual(components.queryItems?.first { $0.name == "url" }?.value, remote)
+    }
+
+    func testCleansTrackingLinks() {
+        let result = HTMLPrivacy.process(#"<a class="btn" href="https://example.com/sale?utm_source=nl&amp;id=7">Shop</a>"#)
+        XCTAssertEqual(result.html, #"<a class="btn" href="https://example.com/sale?id=7">Shop</a>"#)
+        XCTAssertEqual(result.cleanedLinks.first?.removed, ["utm_source"])
+    }
+
+    func testPixelHeuristics() {
+        XCTAssertTrue(HTMLPrivacy.isLikelyPixel(#"<img src="x" style="display: none">"#))
+        XCTAssertTrue(HTMLPrivacy.isLikelyPixel(#"<img src="x" style="width:1px;height:1px">"#))
+        XCTAssertFalse(HTMLPrivacy.isLikelyPixel(#"<img src="x" width="120" height="40">"#))
+        XCTAssertFalse(HTMLPrivacy.isLikelyPixel(#"<img src="x" style="opacity:0.5">"#))
+    }
+}

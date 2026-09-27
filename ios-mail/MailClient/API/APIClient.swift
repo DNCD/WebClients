@@ -76,6 +76,11 @@ actor APIClient {
 
     @discardableResult
     func sendRaw(_ request: APIRequest) async throws -> Data {
+        try await sendWithResponse(request).data
+    }
+
+    /// For endpoints whose answer is in headers or a binary body (the image proxy).
+    func sendWithResponse(_ request: APIRequest) async throws -> (data: Data, response: HTTPURLResponse) {
         do {
             return try await perform(request, tokens: request.authenticated ? tokens : nil)
         } catch APIError.unauthorized where request.authenticated && tokens != nil {
@@ -84,7 +89,7 @@ actor APIClient {
         }
     }
 
-    private func perform(_ request: APIRequest, tokens: SessionTokens?) async throws -> Data {
+    private func perform(_ request: APIRequest, tokens: SessionTokens?) async throws -> (data: Data, response: HTTPURLResponse) {
         var components = URLComponents(url: baseURL.appendingPathComponent(request.path), resolvingAgainstBaseURL: false)!
         if !request.query.isEmpty {
             components.queryItems = request.query
@@ -126,7 +131,7 @@ actor APIClient {
         if let code = envelope?.code, code != 1000, code != 1001 {
             throw APIError.server(status: http.statusCode, code: code, message: envelope?.error ?? "Request failed")
         }
-        return data
+        return (data, http)
     }
 
     /// Mobile-style token refresh (`/auth/v4/refresh`), as used by ProtonCore's RefreshEndpoint.
@@ -145,7 +150,7 @@ actor APIClient {
             ])
             do {
                 // The refresh call identifies the session by UID only.
-                let data = try await perform(request, tokens: SessionTokens(uid: current.uid, accessToken: "", refreshToken: ""))
+                let (data, _) = try await perform(request, tokens: SessionTokens(uid: current.uid, accessToken: "", refreshToken: ""))
                 let response = try JSONDecoder.proton.decode(RefreshResponse.self, from: data)
                 return SessionTokens(uid: current.uid, accessToken: response.accessToken, refreshToken: response.refreshToken)
             } catch {

@@ -32,34 +32,80 @@ struct ComposeView: View {
     @State private var to = ""
     @State private var cc = ""
     @State private var bcc = ""
+    @State private var showsCcBcc = false
     @State private var subject = ""
     @State private var messageBody = ""
     @State private var isSending = false
     @State private var errorMessage: String?
+    @FocusState private var focused: Field?
+
+    private enum Field { case to, cc, bcc, subject, body }
 
     var body: some View {
         NavigationStack {
-            Form {
-                Section {
-                    Picker("From", selection: $from) {
-                        ForEach(service.sendableAddresses) { address in
-                            Text(address.email).tag(Optional(address))
+            ScrollView {
+                VStack(spacing: 0) {
+                    ComposeRow(label: "To") {
+                        recipientField($to, .to)
+                        if !showsCcBcc {
+                            Button {
+                                withAnimation(.snappy) { showsCcBcc = true }
+                            } label: {
+                                Text("Cc/Bcc").font(.caption.weight(.semibold))
+                            }
+                            .buttonStyle(.bordered)
+                            .buttonBorderShape(.capsule)
+                            .controlSize(.mini)
                         }
                     }
-                    RecipientField(title: "To", text: $to)
-                    RecipientField(title: "Cc", text: $cc)
-                    RecipientField(title: "Bcc", text: $bcc)
-                    TextField("Subject", text: $subject)
+                    if showsCcBcc {
+                        ComposeRow(label: "Cc") { recipientField($cc, .cc) }
+                        ComposeRow(label: "Bcc") { recipientField($bcc, .bcc) }
+                    }
+                    ComposeRow(label: "From") {
+                        Menu {
+                            ForEach(service.sendableAddresses) { address in
+                                Button(address.email) { from = address }
+                            }
+                        } label: {
+                            HStack(spacing: 4) {
+                                Text(from?.email ?? "Choose address").lineLimit(1)
+                                Image(systemName: "chevron.up.chevron.down").font(.caption2)
+                            }
+                        }
+                        Spacer()
+                    }
+                    ComposeRow(label: "Subject") {
+                        TextField("", text: $subject)
+                            .focused($focused, equals: .subject)
+                            .font(.body.weight(.medium))
+                    }
+                    TextField("Write your message…", text: $messageBody, axis: .vertical)
+                        .focused($focused, equals: .body)
+                        .lineLimit(12...)
+                        .padding(.horizontal, 16)
+                        .padding(.vertical, 14)
+                        .frame(maxWidth: .infinity, alignment: .topLeading)
+
+                    if let errorMessage {
+                        Label(errorMessage, systemImage: "exclamationmark.triangle.fill")
+                            .font(.footnote)
+                            .foregroundStyle(.red)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(12)
+                            .background(.red.opacity(0.1), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                            .padding(.horizontal, 16)
+                    }
+
+                    Label("End-to-end encrypted to Proton recipients. Others receive it over TLS.", systemImage: "lock.fill")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(16)
                 }
-                Section {
-                    TextEditor(text: $messageBody)
-                        .frame(minHeight: 240)
-                } footer: {
-                    Text("Mail to Proton addresses is end-to-end encrypted. Other recipients receive it unencrypted over TLS.")
-                }
-                ErrorSection(message: errorMessage)
             }
-            .navigationTitle("New Message")
+            .scrollDismissesKeyboard(.interactively)
+            .navigationTitle(subject.isEmpty ? "New Message" : subject)
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
@@ -69,19 +115,39 @@ struct ComposeView: View {
                     if isSending {
                         ProgressView()
                     } else {
-                        Button("Send") { Task { await send() } }
-                            .disabled(from == nil || Self.emails(to).isEmpty)
+                        Button {
+                            Task { await send() }
+                        } label: {
+                            Image(systemName: "arrow.up.circle.fill")
+                                .font(.title2)
+                                .symbolRenderingMode(.palette)
+                                .foregroundStyle(.white, canSend ? Theme.brand : Color(.systemGray3))
+                        }
+                        .disabled(!canSend)
+                        .accessibilityLabel("Send")
                     }
                 }
             }
-            .interactiveDismissDisabled(isSending)
+            .interactiveDismissDisabled(isSending || !messageBody.isEmpty)
             .onAppear {
                 from = service.sendableAddresses.first { $0.id == prefill.fromAddressID } ?? service.sendableAddresses.first
                 to = prefill.to
                 subject = prefill.subject
                 messageBody = prefill.body
+                focused = prefill.to.isEmpty ? .to : .body
             }
         }
+    }
+
+    private var canSend: Bool { from != nil && !Self.emails(to).isEmpty }
+
+    private func recipientField(_ text: Binding<String>, _ field: Field) -> some View {
+        TextField("", text: text)
+            .keyboardType(.emailAddress)
+            .textContentType(.emailAddress)
+            .textInputAutocapitalization(.never)
+            .autocorrectionDisabled()
+            .focused($focused, equals: field)
     }
 
     private func send() async {
@@ -98,7 +164,7 @@ struct ComposeView: View {
                                          body: messageBody))
             dismiss()
         } catch {
-            errorMessage = error.localizedDescription
+            withAnimation { errorMessage = error.localizedDescription }
         }
     }
 
@@ -109,16 +175,21 @@ struct ComposeView: View {
     }
 }
 
-private struct RecipientField: View {
-    let title: String
-    @Binding var text: String
+private struct ComposeRow<Content: View>: View {
+    let label: String
+    @ViewBuilder let content: Content
 
     var body: some View {
-        TextField(title, text: $text, prompt: Text("\(title): name@example.com"))
-            .keyboardType(.emailAddress)
-            .textContentType(.emailAddress)
-            .textInputAutocapitalization(.never)
-            .autocorrectionDisabled()
+        VStack(spacing: 0) {
+            HStack(spacing: 8) {
+                Text(label + ":")
+                    .foregroundStyle(.secondary)
+                content
+            }
+            .padding(.horizontal, 16)
+            .frame(minHeight: 48)
+            Divider().padding(.leading, 16)
+        }
     }
 }
 

@@ -14,13 +14,31 @@ The API calls are ported from `packages/shared/lib/api/*`. The send pipeline fol
 | Sign-in | SRP password auth, TOTP two-factor, two-password (mailbox password) accounts, token refresh |
 | Session | Tokens and derived key passphrases kept in the Keychain (device-only); the password is never stored |
 | Reading | Inbox, Drafts, Sent, Starred, Archive, Spam, Trash, All Mail; paging; search; pull to refresh |
-| Messages | Decrypts plain text, HTML and PGP/MIME bodies; HTML is shown with JavaScript off and remote content blocked until you tap to load it |
+| Messages | Decrypts plain text, HTML and PGP/MIME bodies; HTML is shown with JavaScript off |
+| Tracker protection | Blocks tracking pixels and cleans tracking links (see below); a green shield on the message and in the list shows what was blocked |
 | Actions | Mark read/unread, archive, move to trash, delete from trash |
 | Sending | Plain-text compose and reply. Proton recipients are end-to-end encrypted; other recipients get mail in clear over TLS |
 
 Not implemented yet: attachments (viewing and sending), HTML compose, custom labels and folders,
 conversation view, push notifications, human verification (CAPTCHA) and FIDO2 security keys at sign-in,
 PGP to external recipients' keys, key transparency, and signature verification.
+
+## Tracker protection
+
+Ported from the web client's spy-tracker feature:
+
+- **Tracking images.** Remote images never load directly from the sender. Every image URL in the
+  HTML is rewritten to `pm-proxy://`, and direct `http(s)` loads are blocked by a WebKit content
+  rule. The app asks Proton's image proxy which images are trackers (`GET core/v4/images?DryRun=1`,
+  answered in the `x-pm-tracker-provider` header, like `loadFakeProxy` on the web). Tiny or hidden
+  images also count as tracking pixels. When you tap **Load**, images come through the proxy
+  (`DryRun=0`), which hides your IP address.
+- **Tracking links.** `utm_*`, `fbclid`, `gclid`, `mc_eid`, HubSpot, Marketo and similar
+  parameters are removed from links in HTML and plain-text mail, like `getUTMTrackersFromURL`.
+- **Shield badge.** Opened messages show "N trackers blocked · N links cleaned", with a details
+  sheet listing each tracker company and cleaned link. The list shows a green shield on messages
+  where something was blocked. These counts are kept on the device (message ID → counts only),
+  so a message gets its badge once it has been opened.
 
 ## Build
 
@@ -32,6 +50,9 @@ brew install xcodegen
 xcodegen generate
 open MailClient.xcodeproj
 ```
+
+Xcode will ask you to trust ProtonCore's SwiftLint build plugin the first time; allow it. On the
+command line, pass `-skipPackagePluginValidation`.
 
 The first package resolution clones `protoncore_ios`, which includes prebuilt Go crypto frameworks, so
 it takes a while.
@@ -56,6 +77,7 @@ MailClient/
   Auth/       SRP login, 2FA, key passphrase derivation
   Crypto/     key unlocking (user key → address keys), send-package encryption
   Mail/       message list/read/actions/send, minimal MIME parser
+  Privacy/    link cleaning, HTML rewriting, tracker lookup, proxy image loader
   Storage/    Keychain
   Views/      SwiftUI screens
 MailClientTests/
